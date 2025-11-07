@@ -1,0 +1,38 @@
+SELECT
+    ipg.item_id,
+    ipg.product_group_desc,
+    ipg.product_group_id,
+    ipg.inv_mast_uid,
+    im.item_id
+FROM dbo.Item_Product_Groups AS ipg
+JOIN dbo.inv_mast AS im
+    ON ipg.inv_mast_uid = im.inv_mast_uid
+WHERE
+    (
+        ipg.product_group_desc IN ('Packaging', 'Bag', 'Film', 'Poly')
+        OR
+        ipg.item_id IN (
+            '81520', '801775', '802807', '803030', '804140', '807207',
+            '815225', '822210', '822214', '822332', '835275', '835276',
+            '835277', '835278', '835279', '835280', '835281', '844263',
+            '844461', '845261', '845420', '852325', '872617', '875225',
+            '877530', '877533', '877563', '882817', '892630', '895225',
+            '895227', '903015', '915226', '935174', '944276', '944413',
+            '945215', '954343', '954344', '968013', '977531', '982716',
+            '988415', '989618', '989619', '995235', '8775275'
+        )
+    );
+
+
+
+SELECT
+    ipg.item_id,
+    ipg.product_group_desc,
+    ipg.product_group_id,
+    ipg.inv_mast_uid,
+    im.item_id
+FROM dbo.Item_Product_Groups AS ipg
+JOIN dbo.inv_mast AS im
+    ON ipg.inv_mast_uid = im.inv_mast_uid
+WHERE
+        ipg.product_group_desc IN ('Packaging', 'Bag', 'Film', 'Poly')
