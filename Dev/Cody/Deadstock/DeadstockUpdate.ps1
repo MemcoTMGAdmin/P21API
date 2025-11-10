@@ -1,6 +1,7 @@
 <#  Update P21 item status (class_id2) from SQL result set via API
-    - Serial by default; optional throttle for small parallel batches (PS7+)
+    PS5.1-friendly (serial only; no -Parallel)
     - DryRun supported
+    - Progress bar with ETA (Write-Progress)
     - CSV logs written to ./logs/
 #>
 
@@ -10,11 +11,14 @@ param(
     [switch]$DryRun,
 
     [Parameter(Mandatory = $false)]
-    [int]$Throttle = 1,                 # 1 = serial; >1 uses ForEach-Object -Parallel (PS7+)
+    [ValidateSet('New','Update')]
+    [string]$TransactionStatus = 'New',   # BE v2 upsert path: New updates when key exists
 
     [Parameter(Mandatory = $false)]
-    [ValidateSet('New','Update')]
-    [string]$TransactionStatus = 'Update'   # flip if your endpoint insists on "New"
+    [switch]$ShowProgress = $true,
+
+    [Parameter(Mandatory = $false)]
+    [int]$ProgressEvery = 25              # update progress every N rows
 )
 
 $ProgressPreference = 'SilentlyContinue'
@@ -28,7 +32,7 @@ $TransactionUri    = "$P21ApiBase/uiserver0/api/v2/transaction"
 $SqlServer         = 'p21us-read06.epicordistribution.com,50135'
 $SqlDatabase       = 'az_130611_live'
 $SqlUser           = 'readonly_130611_live'
-$SqlPassword       = 'TWbrLcyz!5s69ab5p'  # TODO: secure from source (e.g., DPAPI/SecretStore)
+$SqlPassword       = 'TWbrLcyz!5s69ab5p'  # TODO: move to SecretStore/DPAPI before prod
 
 # --- T-SQL: MUST RETURN columns [item_id], [status]; extras are fine ---
 $Tsql = @'
@@ -131,7 +135,7 @@ WHERE NOT (
 '@
 
 # --- Allowed statuses (guardrail) ---
-# We accept: $null, any seasonal-like string, or strict DEAD/UNDEAD/INACTIVE
+# allow: NULL, any seasonal-like string (contains 'seas'), or strict DEAD/UNDEAD/INACTIVE
 $AllowedStatuses = 'DEAD','UNDEAD','INACTIVE'
 #endregion -----------------------------------------------------------
 
@@ -142,7 +146,7 @@ function Get-P21Token {
     )
 
     $AuthUri = "$AuthBase/api/security/token/v2"
-    $ClientSecret = "c74ec0f8-220e-4203-a350-051a2bbe0bf4"  # <-- Replace with your real one
+    $ClientSecret = "c74ec0f8-220e-4203-a350-051a2bbe0bf4"  # replace before prod if needed
     $GrantType = "client_credentials"
 
     $Headers = @{
@@ -152,18 +156,16 @@ function Get-P21Token {
 
     $Body = @{
         "ClientSecret" = $ClientSecret
-        "GrantType" = $GrantType
+        "GrantType"    = $GrantType
     } | ConvertTo-Json -Compress
 
     try {
         $response = Invoke-RestMethod -Uri $AuthUri -Method Post -Headers $Headers -Body $Body -TimeoutSec 60
-        if ($response.PSObject.Properties.Name -contains 'token') {
-            return $response.token
-        } elseif ($response.PSObject.Properties.Name -contains 'access_token') {
-            return $response.access_token
-        } else {
-            throw "Unexpected token response format: $($response | ConvertTo-Json -Depth 5)"
-        }
+        $props = $response.PSObject.Properties.Name
+        if     ($props -contains 'AccessToken') { return $response.AccessToken }
+        elseif ($props -contains 'access_token') { return $response.access_token }
+        elseif ($props -contains 'token')        { return $response.token }
+        else { throw "Unexpected token response format: $($response | ConvertTo-Json -Depth 5)" }
     } catch {
         throw "Failed to get Prophet21 token: $($_.Exception.Message)"
     }
@@ -225,11 +227,7 @@ function New-P21ItemStatusBody {
                         Rows               = @(
                             @{
                                 Edits = @(
-                                    @{
-                                        Name          = 'item_id'
-                                        Value         = $ItemId
-                                        IgnoreIfEmpty = $true
-                                    }
+                                    @{ Name='item_id'; Value=$ItemId; IgnoreIfEmpty=$true }
                                 )
                                 RelativeDateEdits = @()
                             }
@@ -239,15 +237,12 @@ function New-P21ItemStatusBody {
                         Name               = 'TABPAGE_CLASSES.classes'
                         BusinessObjectName = $null
                         Type               = 'Form'
-                        Keys               = @()
+                        Keys               = @('item_id')              # key on classes form too
                         Rows               = @(
                             @{
                                 Edits = @(
-                                    @{
-                                        Name          = 'class_id2'
-                                        Value         = $NewStatus    # will serialize to null if $null
-                                        IgnoreIfEmpty = $false
-                                    }
+                                    @{ Name='item_id';  Value=$ItemId;  IgnoreIfEmpty=$true },    # echo key
+                                    @{ Name='class_id2'; Value=$NewStatus; IgnoreIfEmpty=$false } # can be $null to clear
                                 )
                                 RelativeDateEdits = @()
                             }
@@ -275,35 +270,54 @@ $OkLog     = Join-Path $LogDir "p21_status_updates_ok_$ts.csv"
 $ErrLog    = Join-Path $LogDir "p21_status_updates_err_$ts.csv"
 New-Item -ItemType Directory -Path $LogDir -Force | Out-Null
 
-Write-Host "Environment: $EnvName  DryRun: $DryRun  Throttle: $Throttle  TxStatus: $TransactionStatus" -ForegroundColor Cyan
+Write-Host "Environment: $EnvName  DryRun: $DryRun  TxStatus: $TransactionStatus" -ForegroundColor Cyan
 
 # 1) Get token
 $Token = Get-P21Token
 
 # 2) Pull dataset
 $data = Invoke-SqlQuery -Server $SqlServer -Database $SqlDatabase -Query $Tsql -UserName $SqlUser -Password $SqlPassword
-
-if (-not $data -or $data.Rows.Count -eq 0) {
+if (-not $data -or $data.GetType().FullName -ne 'System.Data.DataTable') {
+    throw "Expected System.Data.DataTable; got: $($data.GetType().FullName)"
+}
+if ($data.Rows.Count -eq 0) {
     Write-Host "No rows returned from SQL. Nothing to do." -ForegroundColor Yellow
     return
 }
 
-# 3) Validate shape & statuses
+# 3) Validate shape
 foreach ($col in @('item_id','status')) {
-    if (-not $data.Columns.Contains($col)) {
-        throw "SQL result is missing required column: $col"
-    }
+    if (-not $data.Columns.Contains($col)) { throw "SQL result is missing required column: $col" }
 }
 
+# 3a) Validate item_id non-empty after ToString().Trim()
+$badIdRows = @()
+foreach ($r in $data.Rows) {
+    $iid = if ($null -ne $r['item_id']) { ($r['item_id'].ToString()).Trim() } else { '' }
+    if ([string]::IsNullOrWhiteSpace($iid)) {
+        $badIdRows += [pscustomobject]@{
+            item_id = $r['item_id']
+            status  = [string]$r['status']
+            reason  = 'empty_item_id_after_trim'
+        }
+    }
+}
+if ($badIdRows.Count -gt 0) {
+    $badPath = Join-Path $LogDir "rejected_empty_itemid_$ts.csv"
+    $badIdRows | Export-Csv -NoTypeInformation -Path $badPath
+    throw "Aborting: $($badIdRows.Count) row(s) with empty/whitespace item_id. See $badPath"
+}
+
+# 3b) Validate statuses (allow null or 'seas' variants; else DEAD/UNDEAD/INACTIVE)
 $badRows = @()
 foreach ($row in $data.Rows) {
-    $s = $row.status
-    if ($null -eq $s) { continue }  # allow real nulls
-    $sText = [string]$s
-    if ($sText -match '(?i)seas') { continue }  # allow any seasonal variant ('seas' anywhere, any case)
+    $s = $row['status']
+    if ($null -eq $s) { continue }
+    $sText = $s.ToString()
+    if ($sText -match '(?i)seas') { continue }
     if (-not $AllowedStatuses.Contains($sText.ToUpperInvariant())) {
         $badRows += [pscustomobject]@{
-            item_id = [string]$row.item_id
+            item_id = [string]$row['item_id']
             status  = $sText
             reason  = 'status_not_allowed'
         }
@@ -317,88 +331,66 @@ if ($badRows.Count -gt 0) {
 
 # 4) Prepare headers
 $Headers = @{
-    'Content-Type'  = 'application/json'
     'Authorization' = "Bearer $Token"
+    'Content-Type'  = 'application/json'
+    'Accept'        = 'application/json'
 }
 
-# 5) Process rows
-$ok   = New-Object System.Collections.Concurrent.ConcurrentBag[object]
-$errb = New-Object System.Collections.Concurrent.ConcurrentBag[object]
+# 5) Process rows (serial with progress)
+$ok   = @()
+$errb = @()
 
-$process = {
-    param($r, $TransactionUri, $Headers, $TransactionStatus, $DryRun)
+$rows  = @($data.Rows)
+$total = $rows.Count
+$sw = [System.Diagnostics.Stopwatch]::StartNew()
 
-    $itemId    = [string]$r.item_id
-    # Normalize to upper if not null; leave $null as-is to clear class_id2
-    $newStatus = if ($null -ne $r.status) { ([string]$r.status).ToUpperInvariant() } else { $null }
-    $jsonBody  = New-P21ItemStatusBody -ItemId $itemId -NewStatus $newStatus -TransactionStatus $TransactionStatus
+for ($i = 0; $i -lt $total; $i++) {
+    $r = $rows[$i]
+    try {
+        $itemIdObj = $r['item_id']
+        $itemId    = if ($null -ne $itemIdObj) { ($itemIdObj.ToString()).Trim() } else { '' }
+        $statusObj = $r['status']
+        $newStatus = if ($null -ne $statusObj) { ($statusObj.ToString()).ToUpperInvariant() } else { $null }
 
-    if ($DryRun) {
-        return [pscustomobject]@{
-            item_id         = $itemId
-            requestedStatus = $newStatus
-            httpStatus      = 'DRYRUN'
-            responseId      = $null
+        if ([string]::IsNullOrWhiteSpace($itemId)) { throw "empty item_id after ToString()+Trim()" }
+
+        $jsonBody  = New-P21ItemStatusBody -ItemId $itemId -NewStatus $newStatus -TransactionStatus $TransactionStatus
+
+        if ($DryRun) {
+            $ok += [pscustomobject]@{ item_id=$itemId; requestedStatus=$newStatus; httpStatus='DRYRUN'; responseId=$null }
+        } else {
+            $resp = Invoke-RestMethod -Uri $TransactionUri -Method Post -Headers $Headers -Body $jsonBody -TimeoutSec 120 -MaximumRedirection 0
+            $respId = $null; if ($resp -and $resp.PSObject.Properties.Name -contains 'id') { $respId = $resp.id }
+            $ok += [pscustomobject]@{ item_id=$itemId; requestedStatus=$newStatus; httpStatus=200; responseId=$respId }
+        }
+    } catch {
+        $errb += [pscustomobject]@{
+            item_id         = [string]$r['item_id']
+            requestedStatus = [string]$r['status']
+            error           = $_.Exception.Message
         }
     }
 
-    $resp = Invoke-RestMethod -Uri $TransactionUri -Method Post -Headers $Headers -Body $jsonBody -TimeoutSec 120 -MaximumRedirection 0
-
-    # Best-effort response identifier
-    $respId = $null
-    if ($resp -and $resp.PSObject.Properties.Name -contains 'id') { $respId = $resp.id }
-
-    return [pscustomobject]@{
-        item_id         = $itemId
-        requestedStatus = $newStatus
-        httpStatus      = 200
-        responseId      = $respId
+    if ($ShowProgress -and (($i + 1) % $ProgressEvery -eq 0 -or $i -eq 0 -or $i -eq $total - 1)) {
+        $pct      = [int]((($i + 1) / [double]$total) * 100)
+        $elapsed  = $sw.Elapsed
+        $rate     = ($i + 1) / [math]::Max($elapsed.TotalSeconds, 0.001)
+        $remainS  = ($total - ($i + 1)) / $rate
+        $eta      = [TimeSpan]::FromSeconds([math]::Max($remainS, 0))
+        Write-Progress -Activity "Updating P21 item status (BE v2, Status=$TransactionStatus)" `
+                       -Status   ("{0}/{1} | OK:{2} ERR:{3} | Elapsed {4:mm\:ss} | ETA {5:mm\:ss}" -f ($i+1), $total, $ok.Count, $errb.Count, $elapsed, $eta) `
+                       -PercentComplete $pct
     }
 }
-
-$rows = $data.Rows
-
-if ($Throttle -gt 1 -and $PSVersionTable.PSVersion.Major -ge 7) {
-    $rows | ForEach-Object -Parallel {
-        $cur = $_
-        try {
-            $out = & $using:process $cur $using:TransactionUri $using:Headers $using:TransactionStatus $using:DryRun
-            $using:ok.Add($out)
-        } catch {
-            $using:errb.Add([pscustomobject]@{
-                item_id         = [string]$cur.item_id
-                requestedStatus = [string]$cur.status
-                error           = $_.Exception.Message
-            })
-        }
-    } -ThrottleLimit $Throttle
-} else {
-    foreach ($r in $rows) {
-        try {
-            $out = & $process $r $TransactionUri $Headers $TransactionStatus $DryRun
-            $ok.Add($out)
-        } catch {
-            $errb.Add([pscustomobject]@{
-                item_id         = [string]$r.item_id
-                requestedStatus = [string]$r.status
-                error           = $_.Exception.Message
-            })
-        }
-    }
-}
+if ($ShowProgress) { Write-Progress -Activity "Updating P21 item status" -Completed }
 
 # 6) Write logs
-$ts        = (Get-Date).ToString('yyyyMMdd_HHmmss')  # refresh in case long run
-$LogDir    = Join-Path -Path (Get-Location) -ChildPath 'logs'
-$OkLog     = Join-Path $LogDir "p21_status_updates_ok_$ts.csv"
-$ErrLog    = Join-Path $LogDir "p21_status_updates_err_$ts.csv"
-New-Item -ItemType Directory -Path $LogDir -Force | Out-Null
+$ts2      = (Get-Date).ToString('yyyyMMdd_HHmmss')
+$OkLog2   = Join-Path $LogDir "p21_status_updates_ok_$ts2.csv"
+$ErrLog2  = Join-Path $LogDir "p21_status_updates_err_$ts2.csv"
+$ok  | Export-Csv -NoTypeInformation -Path $OkLog2
+$errb| Export-Csv -NoTypeInformation -Path $ErrLog2
 
-$okArr  = $ok.ToArray()
-$errArr = $errb.ToArray()
-$okArr  | Export-Csv -NoTypeInformation -Path $OkLog
-$errArr | Export-Csv -NoTypeInformation -Path $ErrLog
-
-Write-Host ("Done. OK: {0}  ERR: {1}" -f $okArr.Count, $errArr.Count) -ForegroundColor Green
-Write-Host "Logs: `n  $OkLog`n  $ErrLog"
+Write-Host ("Done. OK: {0}  ERR: {1}" -f $ok.Count, $errb.Count) -ForegroundColor Green
+Write-Host "Logs: `n  $OkLog2`n  $ErrLog2"
 #endregion -----------------------------------------------------------
