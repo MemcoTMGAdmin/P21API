@@ -1,10 +1,3 @@
-<#  Update P21 item status (class_id2) from SQL result set via API
-    PS5.1-friendly (serial only; no -Parallel)
-    - DryRun supported
-    - Progress bar with ETA (Write-Progress)
-    - CSV logs written to ./logs/
-#>
-
 #region -------------------- Parameters & Globals --------------------
 param(
     [Parameter(Mandatory = $false)]
