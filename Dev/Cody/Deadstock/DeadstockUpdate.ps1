@@ -53,8 +53,9 @@ first_receipt_by_item AS (
     LEFT JOIN dbo.po_line pl ON pl.inv_mast_uid = im.inv_mast_uid
     GROUP BY im.item_id
 )
-SELECT TOP (10)
+SELECT TOP (1)
     im.item_id,
+    im.inv_mast_uid,
     q.qty,
     li.last_invoiced,
     im.class_id2,
@@ -291,7 +292,7 @@ function New-P21ItemStatusBody {
                         Name               = 'TABPAGE_CLASSES.classes'
                         BusinessObjectName = $null
                         Type               = 'Form'
-                        Keys               = @('item_id')              # key on classes form too
+                        Keys               = @('inv_mast_uid')              # key on classes form too
                         Rows               = @(
                             @{
                                 Edits = @(
@@ -435,15 +436,39 @@ for ($i = 0; $i -lt $total; $i++) {
             responseId       = $respId
             attempts         = $attempts
         }
-    } catch {
+     } catch {
         $errb += [pscustomobject]@{
             item_id          = [string]$r['item_id']
             originalClassId2 = [string]$r['class_id2']
             requestedStatus  = [string]$r['status']
             error            = $_.Exception.Message
         }
-    }
+        # try to extract HTTP response body/status when available
+        $respObj = $null
+        try {
+            if ($_.Exception.Response) {
+                $stream = $_.Exception.Response.GetResponseStream()
+                if ($stream) {
+                    $reader = New-Object System.IO.StreamReader($stream)
+                    $body = $reader.ReadToEnd()
+                    $reader.Close()
+                    $statusCode = $null
+                    try { $statusCode = [int]$_.Exception.Response.StatusCode.value__ } catch {}
+                    $respObj = @{ StatusCode = $statusCode; Body = $body }
+                }
+            }
+        } catch {
+            $respObj = @{ Info = "Could not extract response"; Msg = $_.Exception.Message }
+        }
 
+        $errb += [pscustomobject]@{
+            item_id          = [string]$r['item_id']
+            originalClassId2 = [string]$r['class_id2']
+            requestedStatus  = [string]$r['status']
+            error            = $_.Exception.Message
+            response         = $respObj
+        }
+    }
     if ($ShowProgress -and (($i + 1) % $ProgressEvery -eq 0 -or $i -eq 0 -or $i -eq $total - 1)) {
         $pct      = [int]((($i + 1) / [double]$total) * 100)
         $elapsed  = $sw.Elapsed
@@ -463,6 +488,17 @@ $OkLog2   = Join-Path $LogDir "p21_status_updates_ok_$ts2.csv"
 $ErrLog2  = Join-Path $LogDir "p21_status_updates_err_$ts2.csv"
 $ok  | Export-Csv -NoTypeInformation -Path $OkLog2
 $errb| Export-Csv -NoTypeInformation -Path $ErrLog2
+
+Write-Host ("Done. OK: {0}  ERR: {1}" -f $ok.Count, $errb.Count) -ForegroundColor Green
+Write-Host "Logs: `n  $OkLog2`n  $ErrLog2"
+# 6) Write JSON logs (includes full REST response objects)
+$ts2      = (Get-Date).ToString('yyyyMMdd_HHmmss')
+$OkLog2   = Join-Path $LogDir "p21_status_updates_ok_$ts2.json"
+$ErrLog2  = Join-Path $LogDir "p21_status_updates_err_$ts2.json"
+
+# pretty-print JSON with sufficient depth to include nested REST responses
+$ok  | ConvertTo-Json -Depth 12 | Set-Content -Path $OkLog2 -Encoding UTF8
+$errb| ConvertTo-Json -Depth 12 | Set-Content -Path $ErrLog2 -Encoding UTF8
 
 Write-Host ("Done. OK: {0}  ERR: {1}" -f $ok.Count, $errb.Count) -ForegroundColor Green
 Write-Host "Logs: `n  $OkLog2`n  $ErrLog2"
