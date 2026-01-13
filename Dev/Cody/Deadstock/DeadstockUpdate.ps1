@@ -1,9 +1,6 @@
 #region -------------------- Parameters & Globals --------------------
 param(
     [Parameter(Mandatory = $false)]
-    [switch]$DryRun,
-
-    [Parameter(Mandatory = $false)]
     [ValidateSet('New','Update')]
     [string]$TransactionStatus = 'New',   # BE v2 upsert path: New updates when key exists
 
@@ -20,21 +17,23 @@ $ProgressPreference = 'SilentlyContinue'
 $EnvName           = 'DEV'  # 'DEV' | 'PROD' (informational)
 $P21ApiBase        = 'https://themiddletongroup-play-api.epicordistribution.com'
 $TransactionUri    = "$P21ApiBase/uiserver0/api/v2/transaction"
+$ApiMaxAttempts = 4
+$ApiBaseDelayMs = 1000
+$ApiMaxDelayMs  = 8000
+$ApiTimeoutSec  = 120
 
 # --- SQL connection info (SQL auth ONLY) ---
 $SqlServer         = 'p21us-read06.epicordistribution.com,50135'
 $SqlDatabase       = 'az_130611_live'
 $SqlUser           = 'readonly_130611_live'
-$SqlPassword       = 'TWbrLcyz!5s69ab5p'  # TODO: move to SecretStore/DPAPI before prod
+$SqlPassword = Get-Content .\sqlpwd.txt | ConvertTo-SecureString
 
 # --- T-SQL: MUST RETURN columns [item_id], [status]; extras are fine ---
 $Tsql = @'
-/* === Anchors for day-granularity windows (avoid TZ/off-by-one flaps) === */
 DECLARE @today_utc date = CAST(SYSUTCDATETIME() AS date);
 DECLARE @d45  date = DATEADD(DAY, -45, @today_utc);
 DECLARE @d90  date = DATEADD(DAY, -90, @today_utc);
 
-/* === Pre-aggregations to kill fan-out === */
 WITH qty_by_item AS (
     SELECT im.item_id, COALESCE(SUM(iloc.qty_on_hand), 0) AS qty
     FROM dbo.inv_mast im
@@ -54,8 +53,7 @@ first_receipt_by_item AS (
     LEFT JOIN dbo.po_line pl ON pl.inv_mast_uid = im.inv_mast_uid
     GROUP BY im.item_id
 )
-/* === Final classification with explicit precedence === */
-SELECT
+SELECT TOP (10)
     im.item_id,
     q.qty,
     li.last_invoiced,
@@ -124,7 +122,8 @@ WHERE NOT (
              AND CAST(li.last_invoiced AS date) < @d45 AND CAST(li.last_invoiced AS date) >= @d90 THEN 'INACTIVE'
         ELSE NULL
      END)
-);
+)
+     ORDER BY im.item_id;
 '@
 
 # --- Allowed statuses (guardrail) ---
@@ -172,10 +171,14 @@ function Invoke-SqlQuery {
         [Parameter(Mandatory=$true)][string]$Database,
         [Parameter(Mandatory=$true)][string]$Query,
         [Parameter(Mandatory=$true)][string]$UserName,
-        [Parameter(Mandatory=$true)][string]$Password
+        [Parameter(Mandatory=$true)][System.Security.SecureString]$Password
     )
 
-    $connString = "Server=$Server;Database=$Database;User ID=$UserName;Password=$Password;TrustServerCertificate=True;"
+    $pwdPtr   = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($Password)
+    $plainPwd = [Runtime.InteropServices.Marshal]::PtrToStringBSTR($pwdPtr)
+    [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($pwdPtr)
+
+    $connString = "Server=$Server;Database=$Database;User ID=$UserName;Password=$plainPwd;TrustServerCertificate=True;"
     $table = New-Object System.Data.DataTable
     $conn  = New-Object System.Data.SqlClient.SqlConnection $connString
     $cmd   = $conn.CreateCommand()
@@ -187,9 +190,10 @@ function Invoke-SqlQuery {
         $reader = $cmd.ExecuteReader()
         $table.Load($reader)
         $reader.Close()
-        return $table
+        return ,$table
     }
     finally {
+        $plainPwd = $null
         $conn.Close()
         $conn.Dispose()
     }
@@ -197,6 +201,63 @@ function Invoke-SqlQuery {
 #endregion -----------------------------------------------------------
 
 #region -------------------- API helpers ----------------------------
+function Invoke-RestMethodWithRetry {
+    param(
+        [Parameter(Mandatory=$true)][string]$Uri,
+        [Parameter(Mandatory=$true)][hashtable]$Headers,
+        [Parameter(Mandatory=$true)][string]$Body,
+        [int]$TimeoutSec = 120,
+        [int]$MaxAttempts = 4,
+        [int]$BaseDelayMs = 1000,
+        [int]$MaxDelayMs  = 8000
+    )
+
+    $attempt = 0
+    $lastStatus = $null
+
+    while ($true) {
+        $attempt++
+        try {
+            $resp = Invoke-RestMethod -Uri $Uri -Method Post -Headers $Headers -Body $Body -TimeoutSec $TimeoutSec -MaximumRedirection 0
+            return [pscustomobject]@{ Response = $resp; Attempts = $attempt; HttpStatus = 200 }
+        }
+        catch {
+            # Try to extract HTTP status code (if present)
+            $statusCode = $null
+            try {
+                if ($_.Exception.Response -and $_.Exception.Response.StatusCode) {
+                    # Works in many Windows PowerShell cases
+                    $statusCode = [int]$_.Exception.Response.StatusCode.value__
+                }
+            } catch { }
+
+            $lastStatus = $statusCode
+
+            $retryable = $false
+            if ($null -eq $statusCode) {
+                # No HTTP response -> likely transient network/timeout
+                $retryable = $true
+            } elseif ($statusCode -in 408,429,500,502,503,504) {
+                $retryable = $true
+            }
+
+            if (-not $retryable -or $attempt -ge $MaxAttempts) {
+                # Re-throw with context
+                $msg = $_.Exception.Message
+                if ($statusCode) { $msg = "HTTP $(statusCode): $msg" }
+                throw "API call failed after $attempt attempt(s). $msg"
+            }
+
+            # Exponential backoff + jitter (and optional Retry-After for 429)
+            $delayMs = [math]::Min($MaxDelayMs, $BaseDelayMs * [math]::Pow(2, $attempt - 2))
+            $jitter  = Get-Random -Minimum 0 -Maximum 250
+            $delayMs = [int]($delayMs + $jitter)
+
+            Start-Sleep -Milliseconds $delayMs
+        }
+    }
+}
+
 function New-P21ItemStatusBody {
     param(
         [Parameter(Mandatory=$true)][string]$ItemId,
@@ -234,8 +295,8 @@ function New-P21ItemStatusBody {
                         Rows               = @(
                             @{
                                 Edits = @(
-                                    @{ Name='item_id';  Value=$ItemId;  IgnoreIfEmpty=$true },    # echo key
-                                    @{ Name='class_id2'; Value=$NewStatus; IgnoreIfEmpty=$false } # can be $null to clear
+                                    @{ Name='item_id';  Value=$ItemId;    IgnoreIfEmpty=$true },    # echo key
+                                    @{ Name='class_id2'; Value=$NewStatus; IgnoreIfEmpty=$false }   # can be $null to clear
                                 )
                                 RelativeDateEdits = @()
                             }
@@ -263,7 +324,7 @@ $OkLog     = Join-Path $LogDir "p21_status_updates_ok_$ts.csv"
 $ErrLog    = Join-Path $LogDir "p21_status_updates_err_$ts.csv"
 New-Item -ItemType Directory -Path $LogDir -Force | Out-Null
 
-Write-Host "Environment: $EnvName  DryRun: $DryRun  TxStatus: $TransactionStatus" -ForegroundColor Cyan
+Write-Host "Environment: $EnvName  TxStatus: $TransactionStatus" -ForegroundColor Cyan
 
 # 1) Get token
 $Token = Get-P21Token
@@ -281,6 +342,11 @@ if ($data.Rows.Count -eq 0) {
 # 3) Validate shape
 foreach ($col in @('item_id','status')) {
     if (-not $data.Columns.Contains($col)) { throw "SQL result is missing required column: $col" }
+}
+
+# 3c) Ensure class_id2 column is present (we want it in logs)
+if (-not $data.Columns.Contains('class_id2')) {
+    throw "SQL result is missing expected column for logging: class_id2"
 }
 
 # 3a) Validate item_id non-empty after ToString().Trim()
@@ -342,25 +408,39 @@ for ($i = 0; $i -lt $total; $i++) {
     try {
         $itemIdObj = $r['item_id']
         $itemId    = if ($null -ne $itemIdObj) { ($itemIdObj.ToString()).Trim() } else { '' }
+
         $statusObj = $r['status']
         $newStatus = if ($null -ne $statusObj) { ($statusObj.ToString()).ToUpperInvariant() } else { $null }
+
+        $class2Obj   = $r['class_id2']
+        $origClass2  = if ($null -ne $class2Obj) { ($class2Obj.ToString()).Trim() } else { $null }
 
         if ([string]::IsNullOrWhiteSpace($itemId)) { throw "empty item_id after ToString()+Trim()" }
 
         $jsonBody  = New-P21ItemStatusBody -ItemId $itemId -NewStatus $newStatus -TransactionStatus $TransactionStatus
 
-        if ($DryRun) {
-            $ok += [pscustomobject]@{ item_id=$itemId; requestedStatus=$newStatus; httpStatus='DRYRUN'; responseId=$null }
-        } else {
-            $resp = Invoke-RestMethod -Uri $TransactionUri -Method Post -Headers $Headers -Body $jsonBody -TimeoutSec 120 -MaximumRedirection 0
-            $respId = $null; if ($resp -and $resp.PSObject.Properties.Name -contains 'id') { $respId = $resp.id }
-            $ok += [pscustomobject]@{ item_id=$itemId; requestedStatus=$newStatus; httpStatus=200; responseId=$respId }
+        $call = Invoke-RestMethodWithRetry -Uri $TransactionUri -Headers $Headers -Body $jsonBody `
+            -TimeoutSec $ApiTimeoutSec -MaxAttempts $ApiMaxAttempts -BaseDelayMs $ApiBaseDelayMs -MaxDelayMs $ApiMaxDelayMs
+
+        $resp     = $call.Response
+        $attempts = $call.Attempts
+        $respId   = $null
+        if ($resp -and $resp.PSObject.Properties.Name -contains 'id') { $respId = $resp.id }
+
+        $ok += [pscustomobject]@{
+            item_id          = $itemId
+            originalClassId2 = $origClass2
+            requestedStatus  = $newStatus
+            httpStatus       = 200
+            responseId       = $respId
+            attempts         = $attempts
         }
     } catch {
         $errb += [pscustomobject]@{
-            item_id         = [string]$r['item_id']
-            requestedStatus = [string]$r['status']
-            error           = $_.Exception.Message
+            item_id          = [string]$r['item_id']
+            originalClassId2 = [string]$r['class_id2']
+            requestedStatus  = [string]$r['status']
+            error            = $_.Exception.Message
         }
     }
 
