@@ -31,27 +31,38 @@ $SqlPassword = Get-Content .\sqlpwd.txt | ConvertTo-SecureString
 # --- T-SQL: MUST RETURN columns [item_id], [status]; extras are fine ---
 $Tsql = @'
 DECLARE @today_utc date = CAST(SYSUTCDATETIME() AS date);
-DECLARE @d45  date = DATEADD(DAY, -45, @today_utc);
-DECLARE @d90  date = DATEADD(DAY, -90, @today_utc);
+DECLARE @d45       date = DATEADD(DAY, -45, @today_utc);
+DECLARE @d90       date = DATEADD(DAY, -90, @today_utc);
 
 WITH qty_by_item AS (
-    SELECT im.item_id, COALESCE(SUM(iloc.qty_on_hand), 0) AS qty
+    SELECT
+        im.item_id,
+        COALESCE(SUM(iloc.qty_on_hand), 0) AS qty
     FROM dbo.inv_mast im
-    LEFT JOIN dbo.inv_loc iloc ON iloc.inv_mast_uid = im.inv_mast_uid
-    GROUP BY im.item_id
+    LEFT JOIN dbo.inv_loc iloc
+        ON iloc.inv_mast_uid = im.inv_mast_uid
+    GROUP BY
+        im.item_id
 ),
 last_invoice_by_item AS (
-    SELECT im.item_id, MAX(il.date_created) AS last_invoiced
+    SELECT
+        im.item_id,
+        MAX(il.date_created) AS last_invoiced
     FROM dbo.inv_mast im
-    LEFT JOIN dbo.invoice_line il ON il.inv_mast_uid = im.inv_mast_uid
-    GROUP BY im.item_id
+    LEFT JOIN dbo.invoice_line il
+        ON il.inv_mast_uid = im.inv_mast_uid
+    GROUP BY
+        im.item_id
 ),
 first_receipt_by_item AS (
-    SELECT im.item_id,
-           MIN(CASE WHEN pl.received_date IS NOT NULL THEN pl.received_date END) AS first_received
+    SELECT
+        im.item_id,
+        MIN(CASE WHEN pl.received_date IS NOT NULL THEN pl.received_date END) AS first_received
     FROM dbo.inv_mast im
-    LEFT JOIN dbo.po_line pl ON pl.inv_mast_uid = im.inv_mast_uid
-    GROUP BY im.item_id
+    LEFT JOIN dbo.po_line pl
+        ON pl.inv_mast_uid = im.inv_mast_uid
+    GROUP BY
+        im.item_id
 )
 SELECT TOP (1)
     im.item_id,
@@ -61,30 +72,31 @@ SELECT TOP (1)
     im.class_id2,
     fr.first_received,
     CASE
-        /* 1) Seasonal override (human-curated wins) */
-        WHEN im.class_id2 IS NOT NULL AND LOWER(im.class_id2) LIKE '%seas%' THEN im.class_id2
+        /* 1) Seasonal override (human-curated wins, normalize to allowed label) */
+        WHEN im.class_id2 IS NOT NULL
+         AND LOWER(im.class_id2) LIKE '%seas%' THEN 'Seasonal Item'
 
         /* 2) No stock on hand */
         WHEN q.qty = 0 THEN NULL
 
-        /* 3) Was DEAD, but sold within last 90 days -> UNDEAD */
+        /* 3) Was DEAD, but sold within last 90 days -> still Dead Stock (keep branch for future) */
         WHEN im.class_id2 IS NOT NULL
          AND LOWER(im.class_id2) LIKE '%dead%'
          AND li.last_invoiced IS NOT NULL
-         AND CAST(li.last_invoiced AS date) >= @d90 THEN 'UNDEAD'
+         AND CAST(li.last_invoiced AS date) >= @d90 THEN 'Dead Stock'
 
-        /* 4) DEAD (independent of current class), stocked & stale */
+        /* 4) Dead Stock (independent of current class), stocked & stale */
         WHEN q.qty > 0 AND (
                (li.last_invoiced IS NOT NULL AND CAST(li.last_invoiced AS date) < @d90)
             OR (li.last_invoiced IS NULL     AND fr.first_received IS NOT NULL AND CAST(fr.first_received AS date) < @d90)
-        ) THEN 'DEAD'
+        ) THEN 'Dead Stock'
 
-        /* 5) INACTIVE: 46–90 day quiet window, only if currently unclassified */
+        /* 5) 45 Day Inactive Item: 46–90 day quiet window, only if currently unclassified */
         WHEN q.qty > 0
          AND im.class_id2 IS NULL
          AND li.last_invoiced IS NOT NULL
          AND CAST(li.last_invoiced AS date) <  @d45
-         AND CAST(li.last_invoiced AS date) >= @d90 THEN 'INACTIVE'
+         AND CAST(li.last_invoiced AS date) >= @d90 THEN '45 Day Inactive Item'
 
         /* 6) Otherwise active/normal */
         ELSE NULL
@@ -98,39 +110,37 @@ LEFT JOIN first_receipt_by_item fr ON fr.item_id = im.item_id
 WHERE NOT (
     (im.class_id2 IS NULL AND
      CASE
-        WHEN im.class_id2 IS NOT NULL AND LOWER(im.class_id2) LIKE '%seas%' THEN im.class_id2
+        WHEN im.class_id2 IS NOT NULL AND LOWER(im.class_id2) LIKE '%seas%' THEN 'Seasonal Item'
         WHEN q.qty = 0 THEN NULL
-        WHEN im.class_id2 IS NOT NULL AND LOWER(im.class_id2) LIKE '%dead%' AND li.last_invoiced IS NOT NULL AND CAST(li.last_invoiced AS date) >= @d90 THEN 'UNDEAD'
+        WHEN im.class_id2 IS NOT NULL AND LOWER(im.class_id2) LIKE '%dead%' AND li.last_invoiced IS NOT NULL AND CAST(li.last_invoiced AS date) >= @d90 THEN 'Dead Stock'
         WHEN q.qty > 0 AND (
                (li.last_invoiced IS NOT NULL AND CAST(li.last_invoiced AS date) < @d90)
             OR (li.last_invoiced IS NULL     AND fr.first_received IS NOT NULL AND CAST(fr.first_received AS date) < @d90)
-        ) THEN 'DEAD'
+        ) THEN 'Dead Stock'
         WHEN q.qty > 0 AND im.class_id2 IS NULL AND li.last_invoiced IS NOT NULL
-             AND CAST(li.last_invoiced AS date) < @d45 AND CAST(li.last_invoiced AS date) >= @d90 THEN 'INACTIVE'
+             AND CAST(li.last_invoiced AS date) < @d45 AND CAST(li.last_invoiced AS date) >= @d90 THEN '45 Day Inactive Item'
         ELSE NULL
      END IS NULL)
  OR
     (im.class_id2 IS NOT NULL AND
      im.class_id2 = CASE
-        WHEN im.class_id2 IS NOT NULL AND LOWER(im.class_id2) LIKE '%seas%' THEN im.class_id2
+        WHEN im.class_id2 IS NOT NULL AND LOWER(im.class_id2) LIKE '%seas%' THEN 'Seasonal Item'
         WHEN q.qty = 0 THEN NULL
-        WHEN im.class_id2 IS NOT NULL AND LOWER(im.class_id2) LIKE '%dead%' AND li.last_invoiced IS NOT NULL AND CAST(li.last_invoiced AS date) >= @d90 THEN 'UNDEAD'
+        WHEN im.class_id2 IS NOT NULL AND LOWER(im.class_id2) LIKE '%dead%' AND li.last_invoiced IS NOT NULL AND CAST(li.last_invoiced AS date) >= @d90 THEN 'Dead Stock'
         WHEN q.qty > 0 AND (
                (li.last_invoiced IS NOT NULL AND CAST(li.last_invoiced AS date) < @d90)
             OR (li.last_invoiced IS NULL     AND fr.first_received IS NOT NULL AND CAST(fr.first_received AS date) < @d90)
-        ) THEN 'DEAD'
+        ) THEN 'Dead Stock'
         WHEN q.qty > 0 AND im.class_id2 IS NULL AND li.last_invoiced IS NOT NULL
-             AND CAST(li.last_invoiced AS date) < @d45 AND CAST(li.last_invoiced AS date) >= @d90 THEN 'INACTIVE'
+             AND CAST(li.last_invoiced AS date) < @d45 AND CAST(li.last_invoiced AS date) >= @d90 THEN '45 Day Inactive Item'
         ELSE NULL
      END)
 )
-     ORDER BY im.item_id;
+ORDER BY
+    im.item_id;
 '@
 
-# --- Allowed statuses (guardrail) ---
-# allow: NULL, any seasonal-like string (contains 'seas'), or strict DEAD/UNDEAD/INACTIVE
-$AllowedStatuses = 'DEAD','UNDEAD','INACTIVE'
-#endregion -----------------------------------------------------------
+
 
 #region -------------------- Token acquisition ----------------------
 function Get-P21Token {
@@ -292,7 +302,7 @@ function New-P21ItemStatusBody {
                         Name               = 'TABPAGE_CLASSES.classes'
                         BusinessObjectName = $null
                         Type               = 'Form'
-                        Keys               = @('inv_mast_uid')              # key on classes form too
+                        Keys               = @('item_id')             
                         Rows               = @(
                             @{
                                 Edits = @(
@@ -375,13 +385,6 @@ foreach ($row in $data.Rows) {
     if ($null -eq $s) { continue }
     $sText = $s.ToString()
     if ($sText -match '(?i)seas') { continue }
-    if (-not $AllowedStatuses.Contains($sText.ToUpperInvariant())) {
-        $badRows += [pscustomobject]@{
-            item_id = [string]$row['item_id']
-            status  = $sText
-            reason  = 'status_not_allowed'
-        }
-    }
 }
 if ($badRows.Count -gt 0) {
     $badPath = Join-Path $LogDir "rejected_rows_$ts.csv"
