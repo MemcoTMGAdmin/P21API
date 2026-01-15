@@ -25,3 +25,11 @@ Get-ADReplicationAttributeMetadata `
 
 Get-ADUser $Usernamer -Server $Server -Properties whenChanged | Select whenChanged
 
+
+
+
+
+KwTwKzuw7f7MmfZl
+Read-Host "KwTwKzuw7f7MmfZl" -AsSecureString |
+    ConvertFrom-SecureString |
+    Set-Content .\smtp2go_pwd.txt

@@ -21,6 +21,15 @@ $ApiMaxAttempts = 4
 $ApiBaseDelayMs = 1000
 $ApiMaxDelayMs  = 8000
 $ApiTimeoutSec  = 120
+# --- Email (SMTP2GO) ---
+$SmtpServer = 'mail.smtp2go.com'
+$SmtpPort   = 587
+$MailFrom   = 'IT@themiddletongroup.com'
+$MailTo     = 'italerts@tmgprivate.com'
+
+$SmtpUser   = 'ITScript'
+$SmtpPassword = Get-Content .\smtp2go_pwd.txt | ConvertTo-SecureString
+$SmtpCred   = New-Object System.Management.Automation.PSCredential($SmtpUser, $SmtpPassword)
 
 # --- SQL connection info (SQL auth ONLY) ---
 $SqlServer         = 'p21us-read06.epicordistribution.com,50135'
@@ -325,7 +334,36 @@ function New-P21ItemStatusBody {
     ($body | ConvertTo-Json -Depth 12 -Compress)
 }
 #endregion -----------------------------------------------------------
+#region -------------------- Sendmail --------------------------------
+function Send-LogEmailSmtp2Go {
+    param(
+        [Parameter(Mandatory=$true)][string]$SmtpServer,
+        [Parameter(Mandatory=$true)][int]$SmtpPort,
+        [Parameter(Mandatory=$true)][pscredential]$Credential,
+        [Parameter(Mandatory=$true)][string]$From,
+        [Parameter(Mandatory=$true)][string]$To,
+        [Parameter(Mandatory=$true)][string]$Subject,
+        [Parameter(Mandatory=$true)][string]$Body,
+        [Parameter(Mandatory=$true)][string]$AttachmentPath
+    )
 
+    if (-not (Test-Path $AttachmentPath)) {
+        throw "Attachment not found: $AttachmentPath"
+    }
+
+    Send-MailMessage `
+        -SmtpServer $SmtpServer `
+        -Port $SmtpPort `
+        -UseSsl `
+        -Credential $Credential `
+        -From $From `
+        -To $To `
+        -Subject $Subject `
+        -Body $Body `
+        -Attachments $AttachmentPath
+}
+
+#endregion
 #region -------------------- Main flow --------------------------------
 # --- Logging ---
 $ts        = (Get-Date).ToString('yyyyMMdd_HHmmss')
@@ -535,7 +573,35 @@ $merged | Export-Csv -NoTypeInformation -Path $MergedLog
 $RestLog = Join-Path $LogDir "REST_Response_$ts2.json"
 $restResponses | ConvertTo-Json -Depth 50 | Set-Content -Path $RestLog -Encoding UTF8
 
+# 7) Sendmail
+# --- Email merged log ---
+$subject = "Deadstock status updates - $EnvName - $ts2"
+$body    = @"
+Run complete.
 
+Environment: $EnvName
+TxStatus:    $TransactionStatus
+
+OK:  $($ok.Count)
+ERR: $($errb.Count)
+
+Merged CSV:
+$MergedLog
+"@
+    try {
+Send-LogEmailSmtp2Go `
+    -SmtpServer $SmtpServer `
+    -SmtpPort $SmtpPort `
+    -Credential $SmtpCred `
+    -From $MailFrom `
+    -To $MailTo `
+    -Subject $subject `
+    -Body $body `
+    -AttachmentPath $MergedLog
+    } catch {
+        Write-Host "Warning: Failed to send email: $($_.Exception.Message)" -ForegroundColor Yellow
+    }
+# 8) Final console output
 Write-Host ("Done. OK: {0}  ERR: {1}" -f $ok.Count, $errb.Count) -ForegroundColor Green
 Write-Host "Log: `n  $MergedLog"
 Write-Host "REST JSON: `n  $RestLog"
