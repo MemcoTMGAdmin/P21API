@@ -306,7 +306,6 @@ function New-P21ItemStatusBody {
                         Rows               = @(
                             @{
                                 Edits = @(
-                                    @{ Name='item_id';  Value=$ItemId;    IgnoreIfEmpty=$true },    # echo key
                                     @{ Name='class_id2'; Value=$NewStatus; IgnoreIfEmpty=$false }   # can be $null to clear
                                 )
                                 RelativeDateEdits = @()
@@ -414,7 +413,7 @@ for ($i = 0; $i -lt $total; $i++) {
         $itemId    = if ($null -ne $itemIdObj) { ($itemIdObj.ToString()).Trim() } else { '' }
 
         $statusObj = $r['status']
-        $newStatus = if ($null -ne $statusObj) { ($statusObj.ToString()).ToUpperInvariant() } else { $null }
+        $newStatus = if ($null -ne $statusObj) { ($statusObj.ToString()).Trim() } else { $null }
 
         $class2Obj   = $r['class_id2']
         $origClass2  = if ($null -ne $class2Obj) { ($class2Obj.ToString()).Trim() } else { $null }
@@ -428,6 +427,10 @@ for ($i = 0; $i -lt $total; $i++) {
 
         $resp     = $call.Response
         $attempts = $call.Attempts
+        $respJson = $resp | ConvertTo-Json -Depth 50
+        Write-Host "---- API RESPONSE (item_id=$itemId) ----" -ForegroundColor DarkCyan
+        Write-Host $respJson
+        Write-Host "---------------------------------------" -ForegroundColor DarkCyan
         $respId   = $null
         if ($resp -and $resp.PSObject.Properties.Name -contains 'id') { $respId = $resp.id }
 
@@ -439,14 +442,16 @@ for ($i = 0; $i -lt $total; $i++) {
             responseId       = $respId
             attempts         = $attempts
         }
-     } catch {
-        $errb += [pscustomobject]@{
-            item_id          = [string]$r['item_id']
-            originalClassId2 = [string]$r['class_id2']
-            requestedStatus  = [string]$r['status']
-            error            = $_.Exception.Message
-        }
-        # try to extract HTTP response body/status when available
+            } catch {
+        # try to extract HTTP status when available
+        $statusCode = $null
+        try {
+            if ($_.Exception.Response -and $_.Exception.Response.StatusCode) {
+                $statusCode = [int]$_.Exception.Response.StatusCode.value__
+            }
+        } catch { }
+
+        # try to extract HTTP response body when available (optional; not used in merged log)
         $respObj = $null
         try {
             if ($_.Exception.Response) {
@@ -455,8 +460,6 @@ for ($i = 0; $i -lt $total; $i++) {
                     $reader = New-Object System.IO.StreamReader($stream)
                     $body = $reader.ReadToEnd()
                     $reader.Close()
-                    $statusCode = $null
-                    try { $statusCode = [int]$_.Exception.Response.StatusCode.value__ } catch {}
                     $respObj = @{ StatusCode = $statusCode; Body = $body }
                 }
             }
@@ -468,10 +471,13 @@ for ($i = 0; $i -lt $total; $i++) {
             item_id          = [string]$r['item_id']
             originalClassId2 = [string]$r['class_id2']
             requestedStatus  = [string]$r['status']
+            httpStatus       = $statusCode
             error            = $_.Exception.Message
             response         = $respObj
         }
     }
+
+
     if ($ShowProgress -and (($i + 1) % $ProgressEvery -eq 0 -or $i -eq 0 -or $i -eq $total - 1)) {
         $pct      = [int]((($i + 1) / [double]$total) * 100)
         $elapsed  = $sw.Elapsed
@@ -485,24 +491,34 @@ for ($i = 0; $i -lt $total; $i++) {
 }
 if ($ShowProgress) { Write-Progress -Activity "Updating P21 item status" -Completed }
 
-# 6) Write logs
-$ts2      = (Get-Date).ToString('yyyyMMdd_HHmmss')
-$OkLog2   = Join-Path $LogDir "p21_status_updates_ok_$ts2.csv"
-$ErrLog2  = Join-Path $LogDir "p21_status_updates_err_$ts2.csv"
-$ok  | Export-Csv -NoTypeInformation -Path $OkLog2
-$errb| Export-Csv -NoTypeInformation -Path $ErrLog2
+# 6) Write merged log (single file)
+$ts2       = (Get-Date).ToString('yyyyMMdd_HHmmss')
+$LogDir    = Join-Path -Path (Get-Location) -ChildPath 'logs'
+$MergedLog = Join-Path $LogDir "p21_status_updates_$ts2.csv"
+
+# Build merged rows: item_id, old class, new status, response code
+$merged = @()
+
+foreach ($o in $ok) {
+    $merged += [pscustomobject]@{
+        item_id          = $o.item_id
+        originalClassId2 = $o.originalClassId2
+        requestedStatus  = $o.requestedStatus
+        httpStatus       = $o.httpStatus
+    }
+}
+
+foreach ($e in $errb) {
+    $merged += [pscustomobject]@{
+        item_id          = $e.item_id
+        originalClassId2 = $e.originalClassId2
+        requestedStatus  = $e.requestedStatus
+        httpStatus       = $e.httpStatus
+    }
+}
+
+$merged | Export-Csv -NoTypeInformation -Path $MergedLog
 
 Write-Host ("Done. OK: {0}  ERR: {1}" -f $ok.Count, $errb.Count) -ForegroundColor Green
-Write-Host "Logs: `n  $OkLog2`n  $ErrLog2"
-# 6) Write JSON logs (includes full REST response objects)
-$ts2      = (Get-Date).ToString('yyyyMMdd_HHmmss')
-$OkLog2   = Join-Path $LogDir "p21_status_updates_ok_$ts2.json"
-$ErrLog2  = Join-Path $LogDir "p21_status_updates_err_$ts2.json"
-
-# pretty-print JSON with sufficient depth to include nested REST responses
-$ok  | ConvertTo-Json -Depth 12 | Set-Content -Path $OkLog2 -Encoding UTF8
-$errb| ConvertTo-Json -Depth 12 | Set-Content -Path $ErrLog2 -Encoding UTF8
-
-Write-Host ("Done. OK: {0}  ERR: {1}" -f $ok.Count, $errb.Count) -ForegroundColor Green
-Write-Host "Logs: `n  $OkLog2`n  $ErrLog2"
+Write-Host "Log: `n  $MergedLog"
 #endregion -----------------------------------------------------------
