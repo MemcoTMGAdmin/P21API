@@ -401,7 +401,8 @@ $Headers = @{
 # 5) Process rows (serial with progress)
 $ok   = @()
 $errb = @()
-
+# Collect full REST responses here (one entry per item processed)
+$restResponses = @()
 $rows  = @($data.Rows)
 $total = $rows.Count
 $sw = [System.Diagnostics.Stopwatch]::StartNew()
@@ -426,11 +427,16 @@ for ($i = 0; $i -lt $total; $i++) {
             -TimeoutSec $ApiTimeoutSec -MaxAttempts $ApiMaxAttempts -BaseDelayMs $ApiBaseDelayMs -MaxDelayMs $ApiMaxDelayMs
 
         $resp     = $call.Response
-        $attempts = $call.Attempts
-        $respJson = $resp | ConvertTo-Json -Depth 50
-        Write-Host "---- API RESPONSE (item_id=$itemId) ----" -ForegroundColor DarkCyan
-        Write-Host $respJson
-        Write-Host "---------------------------------------" -ForegroundColor DarkCyan
+$attempts = $call.Attempts
+
+        # Store the full response object for later JSON logging
+        $restResponses += [pscustomobject]@{
+        item_id     = $itemId
+        httpStatus  = 200
+        attempts    = $attempts
+        response    = $resp
+        captured_at = (Get-Date).ToString('o')
+        }
         $respId   = $null
         if ($resp -and $resp.PSObject.Properties.Name -contains 'id') { $respId = $resp.id }
 
@@ -466,7 +472,15 @@ for ($i = 0; $i -lt $total; $i++) {
         } catch {
             $respObj = @{ Info = "Could not extract response"; Msg = $_.Exception.Message }
         }
-
+        # Store error response details for later JSON logging (when available)
+        $restResponses += [pscustomobject]@{
+        item_id     = [string]$r['item_id']
+        httpStatus  = $statusCode
+        attempts    = $null
+        response    = $respObj
+        error       = $_.Exception.Message
+        captured_at = (Get-Date).ToString('o')
+    }
         $errb += [pscustomobject]@{
             item_id          = [string]$r['item_id']
             originalClassId2 = [string]$r['class_id2']
@@ -518,7 +532,11 @@ foreach ($e in $errb) {
 }
 
 $merged | Export-Csv -NoTypeInformation -Path $MergedLog
+$RestLog = Join-Path $LogDir "REST_Response_$ts2.json"
+$restResponses | ConvertTo-Json -Depth 50 | Set-Content -Path $RestLog -Encoding UTF8
+
 
 Write-Host ("Done. OK: {0}  ERR: {1}" -f $ok.Count, $errb.Count) -ForegroundColor Green
 Write-Host "Log: `n  $MergedLog"
+Write-Host "REST JSON: `n  $RestLog"
 #endregion -----------------------------------------------------------
