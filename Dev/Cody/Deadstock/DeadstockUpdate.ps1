@@ -10,11 +10,21 @@ param(
     [Parameter(Mandatory = $false)]
     [int]$ProgressEvery = 25              # update progress every N rows
 )
+# --- Preflight: required secret files ---
+$requiredFiles = @(
+    '.\sqlpwd.txt',
+    '.\smtp2go_pwd.txt'
+)
+
+$missing = $requiredFiles | Where-Object { -not (Test-Path $_) }
+if ($missing.Count -gt 0) {
+    throw "Missing required secret file(s): $($missing -join ', '). Run setup-secrets.ps1 first."
+}
 
 $ProgressPreference = 'SilentlyContinue'
 
 # --- Environment toggles ---
-$EnvName           = 'DEV'  # 'DEV' | 'PROD' (informational)
+$EnvName           = 'PROD'  # 'DEV' | 'PROD' (informational)
 $P21ApiBase        = 'https://themiddletongroup-play-api.epicordistribution.com'
 $TransactionUri    = "$P21ApiBase/uiserver0/api/v2/transaction"
 $ApiMaxAttempts = 4
@@ -73,7 +83,7 @@ first_receipt_by_item AS (
     GROUP BY
         im.item_id
 )
-SELECT TOP (1)
+SELECT
     im.item_id,
     im.inv_mast_uid,
     q.qty,
